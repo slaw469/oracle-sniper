@@ -2,31 +2,41 @@ name: Oracle Instance Sniper
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:
   snipe:
     runs-on: ubuntu-latest
+    env:
+      COMPARTMENT_ID: "ocid1.tenancy.oc1..aaaaaaaarymrdubanaqs367n3nkdshevcmyhqlyvgbglgktnsi6r7f6ljvsa"
+      SUBNET_ID: "ocid1.subnet.oc1.us-chicago-1.aaaaaaaayp7nnbefv5r6nwlh2wpsqhhnnzvsnm4bf6ikk7ccer7p5cts55da"
+      IMAGE_ID: "ocid1.image.oc1.us-chicago-1.aaaaaaaabcnwiemw73knztoo4nbu7uhlzu24cwdgynddt4yxb2d5vag2rzcq"
+      SHAPE: "VM.Standard.A1.Flex"
     steps:
       - name: Install OCI CLI
         run: pip install oci-cli
 
       - name: Configure OCI
-        run: |
-          mkdir -p ~/.oci
-          printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/key.pem
-          chmod 600 ~/.oci/key.pem
-          printf '[DEFAULT]\nuser=%s\nfingerprint=%s\ntenancy=%s\nregion=%s\nkey_file=%s\n' \
-            "$OCI_USER_OCID" "$OCI_FINGERPRINT" "$OCI_TENANCY_OCID" "$OCI_REGION" \
-            "$HOME/.oci/key.pem" > ~/.oci/config
-          chmod 600 ~/.oci/config
         env:
           OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
           OCI_REGION: ${{ secrets.OCI_REGION }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          cat > ~/.oci/config << EOF
+          [DEFAULT]
+          user=$OCI_USER_OCID
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY_OCID
+          region=$OCI_REGION
+          key_file=$HOME/.oci/key.pem
+          EOF
+          chmod 600 ~/.oci/config
 
       - name: Check for existing instance
         id: check
@@ -37,7 +47,6 @@ jobs:
             --lifecycle-state RUNNING \
             --query 'data[0].id' \
             --raw-output 2>/dev/null || echo "")
-
           if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ] && [ "$EXISTING" != "None" ]; then
             echo "Instance already exists: $EXISTING"
             echo "exists=true" >> "$GITHUB_OUTPUT"
@@ -45,24 +54,16 @@ jobs:
             echo "No existing instance found"
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
-        env:
-          COMPARTMENT_ID: ${{ secrets.OCI_TENANCY_OCID }}
 
       - name: Snipe instance
         if: steps.check.outputs.exists == 'false'
         id: snipe
+        env:
+          SSH_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
-          COMPARTMENT_ID="${{ secrets.OCI_TENANCY_OCID }}"
-          SUBNET_ID="ocid1.subnet.oc1.us-chicago-1.aaaaaaaayp7nnbefv5r6nwlh2wpsqhhnnzvsnm4bf6ikk7ccer7p5cts55da"
-          IMAGE_ID="ocid1.image.oc1.us-chicago-1.aaaaaaaabcnwiemw73knztoo4nbu7uhlzu24cwdgynddt4yxb2d5vag2rzcq"
-          SHAPE="VM.Standard.A1.Flex"
-          SSH_KEY='${{ secrets.SSH_PUBLIC_KEY }}'
-
           ADS=("OrUj:US-CHICAGO-1-AD-1" "OrUj:US-CHICAGO-1-AD-2" "OrUj:US-CHICAGO-1-AD-3")
-
           for AD in "${ADS[@]}"; do
             echo "Trying $AD..."
-
             RESULT=$(oci compute instance launch \
               --compartment-id "$COMPARTMENT_ID" \
               --availability-domain "$AD" \
@@ -75,39 +76,34 @@ jobs:
               --metadata "{\"ssh_authorized_keys\": \"$SSH_KEY\"}" \
               --query 'data.id' \
               --raw-output 2>&1) || true
-
             if [[ "$RESULT" == ocid1.instance.* ]]; then
               echo "SUCCESS! Instance ID: $RESULT"
               INSTANCE_ID="$RESULT"
-
               sleep 60
-              for i in {1..10}; do
+              for i in $(seq 1 10); do
                 PUBLIC_IP=$(oci compute instance list-vnics \
                   --instance-id "$INSTANCE_ID" \
                   --query 'data[0]."public-ip"' \
                   --raw-output 2>/dev/null || echo "")
-
                 if [ -n "$PUBLIC_IP" ] && [ "$PUBLIC_IP" != "null" ] && [ "$PUBLIC_IP" != "None" ]; then
                   echo "Public IP: $PUBLIC_IP"
                   echo "ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
                   echo "success=true" >> "$GITHUB_OUTPUT"
-                  break 2
+                  exit 0
                 fi
                 echo "Waiting for IP (attempt $i/10)..."
                 sleep 15
               done
-
-              echo "Instance created but no IP yet - check Oracle console"
+              echo "Instance created but no IP yet"
               echo "success=true" >> "$GITHUB_OUTPUT"
               echo "ip=check-console" >> "$GITHUB_OUTPUT"
-              break
+              exit 0
             fi
-
             if echo "$RESULT" | grep -qi "Out of capacity\|out of host capacity"; then
               echo "No capacity in $AD"
             elif echo "$RESULT" | grep -qi "TooManyRequests\|429\|rate"; then
-              echo "Rate limited, stopping this run"
-              break
+              echo "Rate limited, stopping"
+              exit 0
             else
               echo "Error: $(echo "$RESULT" | head -3)"
             fi
@@ -123,5 +119,5 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               title: 'Oracle VM Created!',
-              body: `Instance sniped successfully!\n\n**Public IP:** \`${ip}\`\n\n**Connect:**\n\`\`\`\nssh -i ~/Downloads/ssh-key-2026-02-07.key ubuntu@${ip}\n\`\`\`\n\nThe sniper workflow will auto-skip future runs since the instance exists.`
+              body: 'Instance sniped successfully!\n\nPublic IP: ' + ip + '\n\nConnect: ssh -i ~/Downloads/ssh-key-2026-02-07.key ubuntu@' + ip
             });
