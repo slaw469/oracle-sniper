@@ -61,6 +61,53 @@ jobs:
         env:
           SSH_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
+          # Cloud-init script to auto-setup the server on first boot
+          CLOUD_INIT=$(cat << 'CLOUDINIT'
+          #!/bin/bash
+          set -e
+          exec > /var/log/server-setup.log 2>&1
+          echo "=== Server setup started at $(date) ==="
+
+          # Update system
+          apt-get update && apt-get upgrade -y
+
+          # Install essentials
+          apt-get install -y git curl wget build-essential
+
+          # Install Node.js 20
+          curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+          apt-get install -y nodejs
+
+          # Install Claude Code
+          npm install -g @anthropic-ai/claude-code
+
+          # Install useful tools
+          apt-get install -y tmux htop unzip jq
+
+          # Set up firewall - allow SSH only
+          ufw allow 22/tcp
+          ufw --force enable
+
+          # Create a welcome message
+          cat > /etc/motd << 'MOTD'
+
+          ========================================
+            Oracle Free Tier ARM Server
+            4 OCPUs | 24GB RAM | Ubuntu
+            Claude Code is installed!
+            Run: claude
+          ========================================
+
+          MOTD
+
+          # Mark setup as complete
+          touch /home/ubuntu/.setup-complete
+          echo "=== Server setup completed at $(date) ==="
+          CLOUDINIT
+          )
+
+          CLOUD_INIT_B64=$(echo "$CLOUD_INIT" | base64 -w 0)
+
           ADS=("OrUj:US-CHICAGO-1-AD-1" "OrUj:US-CHICAGO-1-AD-2" "OrUj:US-CHICAGO-1-AD-3")
           for AD in "${ADS[@]}"; do
             echo "Trying $AD..."
@@ -73,7 +120,7 @@ jobs:
               --subnet-id "$SUBNET_ID" \
               --display-name "claude-server" \
               --assign-public-ip true \
-              --metadata "{\"ssh_authorized_keys\": \"$SSH_KEY\"}" \
+              --metadata "{\"ssh_authorized_keys\": \"$SSH_KEY\", \"user_data\": \"$CLOUD_INIT_B64\"}" \
               --query 'data.id' \
               --raw-output 2>&1) || true
             if [[ "$RESULT" == ocid1.instance.* ]]; then
@@ -119,5 +166,31 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               title: 'Oracle VM Created!',
-              body: 'Instance sniped successfully!\n\nPublic IP: ' + ip + '\n\nConnect: ssh -i ~/Downloads/ssh-key-2026-02-07.key ubuntu@' + ip
+              body: [
+                '## Your server is ready!',
+                '',
+                '**Public IP:** `' + ip + '`',
+                '',
+                '### Connect from your Mac:',
+                '```',
+                'ssh -i ~/Downloads/ssh-key-2026-02-07.key ubuntu@' + ip,
+                '```',
+                '',
+                '### Connect from your phone:',
+                '1. Install **Termius** from the App Store',
+                '2. Add host: `' + ip + '`',
+                '3. Username: `ubuntu`',
+                '4. Import your SSH private key',
+                '',
+                '### What was auto-installed:',
+                '- Node.js 20',
+                '- Claude Code (`claude`)',
+                '- git, tmux, htop, jq',
+                '- UFW firewall (SSH only)',
+                '',
+                'Cloud-init setup takes ~3-5 min after boot.',
+                'Check progress: `cat /var/log/server-setup.log`',
+                '',
+                'Once setup is done, just run `claude` and authenticate!'
+              ].join('\n')
             });
